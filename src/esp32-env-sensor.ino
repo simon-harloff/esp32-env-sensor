@@ -7,6 +7,7 @@
 #include <U8g2lib.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
+#include <Adafruit_CCS811.h>
 
 // OLED display setup
 #define OLED_MOSI 23
@@ -16,18 +17,21 @@
 #define OLED_RST 17
 U8G2_SH1106_128X64_NONAME_1_4W_SW_SPI disp(U8G2_R0, OLED_CLK, OLED_MOSI, OLED_CS, OLED_DC, OLED_RST);
 
-// air quality sensor
-#define SDA_PIN 21
-#define SCL_PIN 22
+// BME680 sensor
 Adafruit_BME680 bme;
+
+// CCS811 sensor
+Adafruit_CCS811 ccs;
 
 // sensor oled display vars
 const char defaultTemperatureLine[]   = "   T: --.-C";
 const char defaultHumidityLine[]      = "   H: --.-%";
+const char defaultPressureLine[]      = "   P: ---.-hPa";
 const char defaultCO2Line[]           = " CO2: ---.-ppm";
 const char defaultTVOCLine[]          = "TVOC: ---.-ppb";
 const char temperatureLineTemplate[]  = "   T: %2.1fC";
 const char humidityLineTemplate[]     = "   H: %2.1f%%";
+const char pressureLineTemplate[]     = "   P: %3.1fhPa";
 const char co2LineTemplate[]          = " CO2: %3.1fppm";
 const char tvocLineTemplate[]         = "TVOC: %3.1fppb";
 
@@ -36,20 +40,12 @@ struct BME680Result {
   float temperature;
   float humidity;
   float pressure;
-  float co2;
-  float tvoc;
 };
 
 struct CCS811Result {
   bool hasValues = false;
   float co2;
   float tvoc;
-};
-
-struct DHT11Result {
-  bool hasValues = false;
-  float temperature;
-  float humidity;
 };
 
 // wifi vars
@@ -67,11 +63,16 @@ void setup() {
   Serial.begin(115200);
   Serial.println("[setup] begin");
 
-  // initialise air quality sensor
-  // Wire.begin(SDA_PIN, SCL_PIN);
-  auto bmeResult = bme.begin();
+  // intialize the CCS811 sensor
+  auto ccsResult = ccs.begin(0x5A);
+  if (!ccsResult) {
+    Serial.println("[setup] CCS811 error");
+  }
+
+  // initialise BME680 sensor
+  auto bmeResult = bme.begin(0x76);
   if (!bmeResult) {
-    Serial.println("[setup] error setting up air quality sensor");
+    Serial.println("[setup] BME680 error");
   }
 
   // initialize OLED display
@@ -104,18 +105,19 @@ void loop() {
     mqttConnected = setupMQTT();
   }
 
-  auto bmeResult = readBME();
-  drawStatistics(bmeResult);
+  auto bmeResult = readBME680();
+  auto ccsResult = readCCS811();
+  drawStatistics(bmeResult, ccsResult);
 
   // send results via MQTT if the connection is established
   if (mqttConnected) {
-    sendMQTT(bmeResult);
+    sendMQTT(bmeResult, ccsResult);
   }
 
   delay(1000);
 }
 
-void sendMQTT(BME680Result bmeResult) {
+void sendMQTT(BME680Result bmeResult, CCS811Result ccsResult) {
   
   // if we are not connected to MQTT broker then return
   if (!mqttClient.connected()) return;
@@ -134,21 +136,25 @@ void sendMQTT(BME680Result bmeResult) {
       
       char humdityString[5];
       snprintf(humdityString, 5, "%2.1f", bmeResult.humidity);
+
+      char pressureString[5];
+      snprintf(pressureString, 5, "%3.1f", bmeResult.pressure);
       
       mqttClient.publish("temperature", temperatureString);
       mqttClient.publish("humidity", humdityString);
-
-      if (false) {
-        char co2String[7];
-        snprintf(co2String, 7, "%3.1f", bmeResult.co2);
-        
-        char tvocString[7];
-        snprintf(tvocString, 7, "%3.1f", bmeResult.tvoc);
-
-        mqttClient.publish("co2", co2String);
-        mqttClient.publish("tvoc", tvocString);
-      } 
+      mqttClient.publish("pressure", pressureString);
     }
+
+    if (ccsResult.hasValues) {
+      char co2String[7];
+      snprintf(co2String, 7, "%3.1f", ccsResult.co2);
+      
+      char tvocString[7];
+      snprintf(tvocString, 7, "%3.1f", ccsResult.tvoc);
+
+      mqttClient.publish("co2", co2String);
+      mqttClient.publish("tvoc", tvocString);
+    } 
 
     lastMqttSendTime = millis();
   }
@@ -181,7 +187,7 @@ bool setupWiFi() {
   return false;
 }
 
-void drawStatistics(BME680Result bmeResult) {
+void drawStatistics(BME680Result bmeResult, CCS811Result ccsResult) {
   disp.firstPage();
   do {
     disp.setFont(u8g2_font_8x13B_tf);
@@ -199,9 +205,9 @@ void drawStatistics(BME680Result bmeResult) {
       strncpy(humidityLine, defaultHumidityLine, sizeof(humidityLine));
     }
 
-    if (false) {
-      snprintf(co2Line, sizeof(co2Line), co2LineTemplate, bmeResult.co2);
-      snprintf(tvocLine, sizeof(tvocLine), tvocLineTemplate, bmeResult.tvoc);
+    if (ccsResult.hasValues) {
+      snprintf(co2Line, sizeof(co2Line), co2LineTemplate, ccsResult.co2);
+      snprintf(tvocLine, sizeof(tvocLine), tvocLineTemplate, ccsResult.tvoc);
     } else {
       strncpy(co2Line, defaultCO2Line, sizeof(co2Line));
       strncpy(tvocLine, defaultTVOCLine, sizeof(tvocLine));
@@ -217,7 +223,7 @@ void drawStatistics(BME680Result bmeResult) {
   while ( disp.nextPage() );
 }
 
-BME680Result readBME() {
+BME680Result readBME680() {
   BME680Result result;
 
   unsigned long endTime = bme.beginReading();
@@ -231,43 +237,31 @@ BME680Result readBME() {
     return result;
   }
 
+  result.hasValues = true;
   result.temperature = bme.temperature;
   result.humidity = bme.humidity;
   result.pressure = (bme.pressure / 100.0);
+
+  // Serial.printf("BME680 result - temp: %2.1f; humid: %2.1f; hPA: %3.1f\n", result.temperature, result.humidity, result.pressure);
   
-  return result;
-}
-
-DHT11Result readDHT() {
-  DHT11Result result;
-  
-  // float temperature = dht.readTemperature();
-  // float humidity = dht.readHumidity();
-
-  // if (isnan(temperature) && isnan(humidity)) return result;
-
-  // result.hasValues = true;
-  // result.temperature = temperature;
-  // result.humidity = humidity;
- 
   return result;
 }
 
 CCS811Result readCCS811() {
   CCS811Result result;
   
-  // // if the CCS is not available return
-  // if (!ccs.available()) return result;
+  // if the CCS is not available return
+  if (!ccs.available()) return result;
 
-  // // if there is an error then return
-  // if (ccs.readData() != 0) {
-  //   Serial.println("CCS811 Error");
-  //   return result;
-  // }
+  // if there is an error then return
+  if (ccs.readData() != 0) {
+    Serial.println("CCS811 Error");
+    return result;
+  }
 
-  // result.hasValues = true;
-  // result.co2 = ccs.geteCO2();
-  // result.tvoc = ccs.getTVOC();
+  result.hasValues = true;
+  result.co2 = ccs.geteCO2();
+  result.tvoc = ccs.getTVOC();
 
   return result;
 } 
